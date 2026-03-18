@@ -144,7 +144,212 @@ cd frontend && npm run dev
 <a id="chapter-2"></a>
 ## 第2章：多智能体核心引擎与执行流程
 
-> 待补充。
+第 2 章回答两个核心问题：这个项目的“多智能体”到底由哪些角色组成，以及一次请求进入后是如何在 LangGraph 里流转、汇总、回退并落成最终建议的。第 1 章已经说明仓库分层；本章进一步把 `tradingagents/graph/`、`tradingagents/agents/` 和 `tradingagents/prompts/` 拆成可执行的引擎视图。
+
+### 2.1 引擎总装：`TradingAgentsGraph` 负责把零件组装成工作流
+
+多智能体主引擎的门面类是 [`tradingagents/graph/trading_graph.py`](../tradingagents/graph/trading_graph.py)。它不直接做分析，而是负责把下列部件装配成一个可调用的 LangGraph：
+
+| 组件 | 来源 | 作用 |
+| --- | --- | --- |
+| 双模型客户端 | `create_llm_client()` | 同时创建 `quick_thinking_llm` 与 `deep_thinking_llm`，把快模型分配给分析师/辩论节点，把深模型分配给研究经理与风控裁决节点 |
+| 持久化检查点 | `SqliteSaver` | 把图执行状态写入 `graph_checkpoints.db`，并开启 SQLite WAL 模式，减轻并发写锁问题 |
+| 角色记忆 | `FinancialSituationMemory` | 为多头研究员、空头研究员、交易员、研究经理、风控经理提供复盘记忆检索 |
+| 工具节点 | `ToolNode` | 为市场、新闻、基本面、宏观、资金面等角色预留 LangGraph 工具调用入口 |
+| 数据采集器 | `DataCollector` | 统一预抓取行情、新闻、财务、资金流和指标，避免短线/中线两个周期重复拉数 |
+| 路由器 | `ConditionalLogic` | 决定分析师是否继续调用工具、研究辩论是否继续、风控是否打回交易员 |
+| 图构造器 | `GraphSetup` | 把所有角色节点、条件边和结束边编译成 `StateGraph(AgentState)` |
+| 传播器 | `Propagator` | 生成初始状态、设置 recursion limit、封装 LangGraph 调用参数 |
+| 反思与信号处理 | `Reflector`、`SignalProcessor` | 在主图外做复盘记忆更新，以及从长文本里提取 `BUY / SELL / HOLD` 关键词 |
+
+这意味着 `TradingAgentsGraph` 的职责更接近“工作流装配器”而不是“某一个智能体”。项目把提示词、数据工具、状态结构和条件路由全部外挂成独立模块，便于后续替换模型、裁剪角色或改写执行链。
+
+### 2.2 角色分层：不是单链条，而是“四层协作 + 两级裁决”
+
+`tradingagents/agents/` 里的角色可以分成六组，且每组消费的输入和写回的状态字段都不同。
+
+| 层级 | 角色 | 主要输入 | 主要输出 |
+| --- | --- | --- | --- |
+| 基础分析层 | `market`、`social`、`news`、`fundamentals`、`macro`、`smart_money` | 预抓取数据、周期上下文、用户关注点 | `market_report`、`sentiment_report`、`news_report`、`fundamentals_report`、`macro_report`、`smart_money_report`，以及 `analyst_traces` |
+| 博弈归纳层 | `Game Theory Manager` | `smart_money_report` + `sentiment_report` | `game_theory_report`、`game_theory_signals` |
+| 投研辩论层 | `Bull Researcher`、`Bear Researcher`、`Research Manager` | 基础分析报告、博弈信号、历史记忆、claim 状态 | `investment_debate_state`、`investment_plan` |
+| 交易执行层 | `Trader` | `investment_plan`、用户持仓/风险约束、风控反馈、历史记忆 | `trader_investment_plan` |
+| 风控辩论层 | `Aggressive Analyst`、`Conservative Analyst`、`Neutral Analyst` | 交易员方案、各类研究报告、风险 claim 状态 | `risk_debate_state` |
+| 最终裁决层 | `Risk Judge` | 风控辩论历史、交易员方案、用户上下文、历史记忆 | `risk_feedback_state`、`final_trade_decision` |
+
+这里有两个很重要的设计点：
+
+1. 基础分析层是“并行采样”，目的是从不同维度同时产出证据。
+2. 后三层不是简单总结，而是把“研究结论 -> 可执行方案 -> 风险审查”拆成了三个不同视角的裁决过程。
+
+因此，这套系统并不是六个 analyst 轮流写报告后直接结束，而是把“研究结论是否成立”和“即使结论成立，方案是否能执行”拆成两道独立关卡。
+
+还要注意“角色存在”和“角色被后续主链直接消费”不是一回事。当前实现里，`Bull Researcher`、`Bear Researcher`、`Trader` 和 `Risk Judge` 直接读取的核心输入仍然是 `market_report`、`sentiment_report`、`news_report` 与 `fundamentals_report`；`smart_money_report` 主要先被 `Game Theory Manager` 抽象成 `game_theory_signals` 再进入研究经理；`macro_report` 则更多作为独立报告和最终日志的一部分保留下来，而不是当前收口节点的主输入。这说明仓库已经为更多分析维度预留了角色，但并非所有维度都同等深入地接进了最终裁决链。
+
+### 2.3 共享状态：`AgentState` 是整条链的唯一事实来源
+
+所有节点都围绕 [`tradingagents/agents/utils/agent_states.py`](../tradingagents/agents/utils/agent_states.py) 里的 `AgentState` 读写。它继承自 LangGraph 的 `MessagesState`，但在通用消息之外又加入了大量业务字段。可以把它理解成“本次分析任务的全量上下文 + 中间产物容器”。
+
+| 状态分组 | 代表字段 | 含义 |
+| --- | --- | --- |
+| 标的与市场上下文 | `company_of_interest`、`trade_date`、`instrument_context`、`market_context` | 标准化股票代码、市场归属、交易时段、分析模式、数据截止时间 |
+| 用户上下文 | `user_context`、`user_intent`、`workflow_context` | 用户的仓位、成本、风险偏好、自然语言意图解析结果、请求来源和已选 analyst |
+| 分析报告 | `market_report`、`sentiment_report`、`news_report`、`fundamentals_report`、`macro_report`、`smart_money_report` | 六个 analyst 的原始结论文本 |
+| 中间裁决 | `game_theory_report`、`game_theory_signals`、`investment_plan`、`trader_investment_plan` | 从情绪/主力博弈到研究经理计划，再到交易员可执行方案 |
+| 辩论状态 | `investment_debate_state`、`risk_debate_state`、`risk_feedback_state` | 记录 claim、轮次、焦点问题、是否需要打回重写 |
+| 结果与痕迹 | `final_trade_decision`、`analyst_traces`、`short_term_result`、`medium_term_result`、`metadata` | 最终决策、各 analyst 的结构化摘要、双周期输出和运行时附加信息 |
+
+`Propagator.create_initial_state()` 在图启动前就会把这些字段填好默认值。它先做三件事：
+
+1. 用 `infer_instrument_context()` 推断标的是 A 股还是美股，并补全交易所、币种和资产类型。
+2. 用 `build_market_context()` 推断当前是盘前、盘中、盘后、历史回看还是未来日期，从而决定 `analysis_mode` 与 `data_as_of`。
+3. 用 `normalize_user_context()` 清洗用户仓位、成本、止损比例等输入，再把“标的摘要 + 市场摘要 + 用户摘要”塞进 `messages` 作为所有角色共享的起始提示。
+
+这种做法有两个好处：
+
+- 角色节点不需要自己重复判断“这是 A 股还是美股”“今天是盘前还是盘后”。
+- 后面的交易员和风控节点可以直接消费标准化后的用户约束，而不必重新解析自然语言。
+
+还有一个容易忽略的细节：`analyst_traces` 在状态类型上声明为 `Annotated[List[TraceItem], operator.add]`。这表示多个 analyst 并行执行时会按追加方式合并，不会相互覆盖。它本质上是给最终报告和调试链路准备的“轻量化结构化摘要”。
+
+### 2.4 Prompt 不是纯文案，而是控制平面的一部分
+
+`tradingagents/prompts/catalog.py` 会根据配置里的 `prompt_language` 或 `prompt_language_by_provider`，在 [`tradingagents/prompts/zh.py`](../tradingagents/prompts/zh.py) 与 [`tradingagents/prompts/en.py`](../tradingagents/prompts/en.py) 之间切换。当前中文模板不是简单翻译，而是承担了三层职责：
+
+1. 约束角色行为：例如市场分析师必须覆盖趋势、动量、波动和量价，不允许“堆指标”。
+2. 注入周期视角：`build_horizon_context()` 会把短线/中线、关注点和具体问题拼进每个角色的系统提示。
+3. 输出机读块：多个节点在正文结尾追加 HTML 注释，供图路由和状态归档解析。
+
+当前代码实际依赖的机读块如下：
+
+| 机读标记 | 生产节点 | 作用 |
+| --- | --- | --- |
+| `<!-- VERDICT: {...} -->` | 各 analyst、研究经理、交易员、风控裁决 | 提取方向性摘要，写入 `analyst_traces` 或供信号处理使用 |
+| `<!-- GAME_THEORY: {...} -->` | `Game Theory Manager` | 产出结构化博弈信号，供研究经理收口 |
+| `<!-- DEBATE_STATE: {...} -->` | 多头/空头研究员 | 更新投资辩论里的 claim、焦点 claim、轮次摘要和下轮目标 |
+| `<!-- RISK_STATE: {...} -->` | 激进/保守/中性风控分析师 | 更新风险辩论里的 claim 和下一轮聚焦问题 |
+| `<!-- RISK_JUDGE: {...} -->` | `Risk Judge` | 决定 `pass / revise / reject`，并给出硬约束、执行前提和降风险触发器 |
+
+这套设计很关键。项目并没有使用单独的 JSON API 在节点之间传输中间裁决，而是让 LLM 生成“面向人阅读的正文 + 面向机器解析的 HTML 注释”。这样既保留了研报可读性，又让 LangGraph 能继续做条件路由。
+
+### 2.5 图结构与条件路由：LangGraph 负责编排，状态字段决定去向
+
+[`tradingagents/graph/setup.py`](../tradingagents/graph/setup.py) 明确了整张图的骨架。主路径可以概括为：
+
+```text
+START
+  -> 六类 Analyst 并行
+  -> Game Theory Manager
+  -> Bull Researcher <-> Bear Researcher
+  -> Research Manager
+  -> Trader
+  -> Aggressive -> Conservative -> Neutral 风控辩论
+  -> Risk Judge
+  -> END 或回退到 Trader
+```
+
+具体路由规则由 [`tradingagents/graph/conditional_logic.py`](../tradingagents/graph/conditional_logic.py) 控制：
+
+- `should_continue_market/social/news/fundamentals/macro/smart_money`
+  - 检查 `messages[-1].tool_calls` 是否存在。
+  - 若存在则进入对应 `tools_*` 节点，再回到 analyst。
+  - 若不存在则直接进入 `... Analyst Done`。
+- `should_continue_debate`
+  - 若 `investment_debate_state.count` 已达到 `2 * max_debate_rounds`，交给 `Research Manager` 收口。
+  - 否则在 Bull 和 Bear 之间轮换。
+- `should_continue_risk_analysis`
+  - 若 `risk_debate_state.count` 已达到 `3 * max_risk_discuss_rounds`，交给 `Risk Judge`。
+  - 否则在激进、保守、中性三方之间轮换。
+- `should_revise_after_risk_judge`
+  - 若 `risk_feedback_state.revision_required` 为真，且 `retry_count` 未超过 `max_retries`，则打回 `Trader` 重写方案。
+  - 否则结束图执行。
+
+这里还有一个实现层面的细节值得单独指出：图里虽然保留了 `tools_market`、`tools_news` 等 `ToolNode`，但当前 analyst 节点的主路径通常不会真的走到这些节点。原因有两个：
+
+1. 当前 analyst 实现大多优先从 `DataCollector` 缓存读取数据，缺数据时才直接调用工具包装函数。
+2. 中文提示词又明确要求“严格基于提供的数据输出，不要继续请求工具”。
+
+所以，当前版本的 `ToolNode` 更像是兼容旧式工具调用 prompt 和后续扩展的保留设计，而不是默认主执行链的高频路径。
+
+### 2.6 数据获取与双周期执行：短线、中线共用一套数据池
+
+单次分析有两种入口：
+
+- `propagate()`：单周期执行，输入 `company_name + trade_date + user_context`，返回完整最终状态和提炼后的交易信号。
+- `propagate_async()`：双周期执行，输入 `company_name + trade_date + query`，并行跑 `short` 与 `medium` 两个 horizon。
+
+双周期路径更能代表当前产品形态。其关键流程如下：
+
+1. 若用户给了自然语言 `query`，先调用 `parse_intent()` 提取 `ticker`、`horizons`、`focus_areas`、`specific_questions` 与 `user_context`。
+2. `DataCollector.collect()` 先把所需行情、新闻、全球新闻、板块资金、个股资金、龙虎榜、财务报表和技术指标并行抓完，缓存在内存里。
+3. 对每个 horizon，`Propagator.create_initial_state()` 会构建一份独立状态，但两份状态共享同一个数据缓存。
+4. 各 analyst 再根据 horizon 调整数据窗口：
+   - 短线常用 7 到 14 天窗口，强调技术面、舆情和近期事件。
+   - 中线常用 30 到 90 天窗口，强调基本面、财务报表和政策环境。
+5. 图执行完成后，`_build_horizon_result()` 从完整状态里提取双周期摘要，最终合成为 `short_term` 和 `medium_term` 两个结果块。
+6. 运行结束后，缓存通过 `DataCollector.evict()` 释放，避免长时间堆积。
+
+最小调用示例如下：
+
+```python
+from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+graph = TradingAgentsGraph(debug=False)
+result = await graph.propagate_async(
+    company_name="600519",
+    trade_date="2026-03-18",
+    query="我半仓持有 600519，成本 1500，偏保守，想看短线和中线怎么操作。",
+)
+
+print(result["short_term"]["final_trade_decision"])
+print(result["medium_term"]["final_trade_decision"])
+```
+
+这个例子体现了第 2 章最核心的事实：系统不是只返回一个大段文本，而是先把用户意图解析成结构化上下文，再按不同时间维度各跑一遍同一张图。
+
+### 2.7 从请求进入到报告产出的主执行链
+
+把上面的模块拼起来，一次标准分析请求会经过下面这条链：
+
+1. 请求进入后端，由服务层把股票代码、交易日、自然语言问题和用户约束传给 `TradingAgentsGraph`。
+2. `parse_intent()` 尝试从自然语言里抽取周期、关注点、持仓、成本、止损容忍度等信息；如果 LLM 解析失败，还会用正则做兜底。
+3. `Propagator` 构造 `AgentState`，提前写入标的上下文、市场上下文、默认辩论状态和 `messages` 起始提示。
+4. 六类 analyst 并行生成基础报告，并把各自结论压缩成 `analyst_traces`。
+5. `Game Theory Manager` 只消费情绪和主力资金两个维度，生成“主力 vs 散户”的博弈判断。
+6. `Bull Researcher` 与 `Bear Researcher` 围绕 `claim` 交替辩论，`Research Manager` 在达到轮次上限后收口并输出 `investment_plan`。
+7. `Trader` 把研究计划翻译成可执行交易方案，并显式纳入用户仓位、成本、风控反馈和历史记忆。
+8. 激进、保守、中性三位风控分析师围绕执行风险继续辩论，更新 `risk_debate_state`。
+9. `Risk Judge` 给出最终裁决，并写入 `risk_feedback_state`：
+   - `pass`：直接结束。
+   - `revise`：把硬约束和修订原因打回给 `Trader`，允许一次重写。
+   - `reject`：结束并保留否决意见。
+10. `TradingAgentsGraph` 把结果记录到 `eval_results/<ticker>/TradingAgentsStrategy_logs/`，并通过 `SignalProcessor` 从长文本中再提炼一次 `BUY / SELL / HOLD`。
+
+用一张简化图表示，就是：
+
+```text
+自然语言/代码输入
+  -> 意图解析与上下文标准化
+  -> 数据预抓取与缓存
+  -> 六类 Analyst 并行出报告
+  -> 主力/情绪博弈归纳
+  -> 多空研究辩论
+  -> 研究经理收口
+  -> 交易员生成执行方案
+  -> 三方风控辩论
+  -> 风控裁决
+  -> 记录日志、输出最终报告与 BUY/SELL/HOLD
+```
+
+### 2.8 这一章可以带走的结论
+
+理解第 2 章后，你应该能抓住这套引擎的三个本质：
+
+1. 它的“多智能体”重点不在于角色数量，而在于把研究、执行和风控拆成可回退的多级裁决链。
+2. 它的“共享状态”不是简单消息列表，而是带有 claim、周期、用户约束和结构化机读块的业务状态机。
+3. 它的“图编排”并不神秘，核心就是 LangGraph 的并行 fan-out、条件路由和有限轮次辩论。
+
+理解了这一点，再去看[第 3 章](#chapter-3)的后端 API 和任务落库，就能更清楚地知道：服务层到底是在调用一个“大模型接口”，还是在调度一条具备状态、回退和持久化能力的投研工作流。模型接入、提示词语言切换和运行配置则放到[第 5 章](#chapter-5)展开。
 
 <a id="chapter-3"></a>
 ## 第3章：后端 API、服务层与数据持久化
