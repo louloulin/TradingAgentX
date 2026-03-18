@@ -375,7 +375,243 @@ if __name__ == "__main__":
 <a id="chapter-5"></a>
 ## 第5章：数据源、模型接入、配置与部署方式
 
-> 待补充。
+第 5 章回答四个更“工程落地”的问题：系统到底从哪里拿数据、模型供应商是怎么接进来的、运行时配置从哪几层叠加，以及这套前后端一体仓库实际上支持哪些部署姿势。前两章已经解释了多智能体如何编排；本章则把 `tradingagents/dataflows/`、`tradingagents/llm_clients/`、`tradingagents/default_config.py`、[`api/main.py`](../api/main.py) 和 [`Dockerfile`](../Dockerfile) 串成一条“可运行的基础设施链路”。
+
+### 5.1 数据层总览：统一工具名，供应商在底层路由
+
+TradingAgentX 的数据层并不是“每个 agent 直接绑一个第三方 SDK”，而是先在 [`tradingagents/agents/utils/agent_utils.py`](../tradingagents/agents/utils/agent_utils.py) 暴露统一工具名，再由 [`tradingagents/dataflows/interface.py`](../tradingagents/dataflows/interface.py) 把这些调用路由到具体供应商。对上层 agent 来说，入口一直是 `get_stock_data()`、`get_news()`、`get_fundamentals()` 这类统一函数；对底层实现来说，真正执行的是 provider registry 里的某个 provider 方法。
+
+`interface.py` 当前把工具分成五类：
+
+| 类别 | 代表方法 | 典型消费者 |
+| --- | --- | --- |
+| `core_stock_apis` | `get_stock_data` | 市场分析师、回测服务、K 线接口 |
+| `technical_indicators` | `get_indicators` | 市场分析师、主力资金分析师 |
+| `fundamental_data` | `get_fundamentals`、`get_balance_sheet`、`get_cashflow`、`get_income_statement` | 基本面分析师 |
+| `news_data` | `get_news`、`get_global_news`、`get_insider_transactions` | 新闻分析师、舆情分析师 |
+| `cn_market_data` | `get_board_fund_flow`、`get_individual_fund_flow`、`get_lhb_detail`、`get_zt_pool`、`get_hot_stocks_xq` | 宏观分析师、主力资金分析师、数据采集器 |
+
+这里有个实现层面的关键点：这些方法大多返回的是 CSV 字符串、Markdown 文本或格式化表格，而不是强类型对象。也就是说，系统的数据边界本质上是“面向 LLM 的文本数据层”，不是传统量化框架里的 DataFrame API。这解释了为什么 provider 可以混用 yfinance、AkShare、Alpha Vantage 之类风格完全不同的接口。
+
+### 5.2 Provider Registry 与回退机制：同一工具可串联多个数据源
+
+[`tradingagents/dataflows/providers/registry.py`](../tradingagents/dataflows/providers/registry.py) 把当前已注册的供应商固定为：
+
+1. `cn_akshare`
+2. `cn_baostock`
+3. `yfinance`
+4. `alpha_vantage`
+5. `cn_stub`
+
+[`tradingagents/default_config.py`](../tradingagents/default_config.py) 则给 `core_stock_apis`、`technical_indicators`、`fundamental_data`、`news_data` 这四类默认配置了逗号分隔的 vendor chain：`cn_akshare,cn_baostock,yfinance`。`route_to_vendor()` 会先读取类别级或工具级配置，再把 registry 中剩余 provider 自动追加到回退链末尾。因此，它的行为不是“只按配置命中一个供应商”，而是：
+
+1. 优先尝试显式配置的 provider 顺序。
+2. 若遇到 `NotImplementedError`、Alpha Vantage 频率限制或其他运行时异常，自动回退到下一个 provider。
+3. 若显式配置没覆盖所有 provider，自动把剩余 provider 追加进去，尽量提高可用性。
+
+这套机制决定了文档里必须区分“名义支持”和“真正可用”。当前各 provider 的能力边界大致如下：
+
+| Provider | 已实现能力 | 主要特点与限制 |
+| --- | --- | --- |
+| `cn_akshare` | A 股行情、指标、财报、新闻、全球新闻、内幕交易、板块/个股资金流、龙虎榜、涨停池、雪球热股 | 当前最完整的 A 股 provider，也是 `cn_market_data` 类调用的实际主力 |
+| `cn_baostock` | A 股行情、指标 | 财报、新闻、内幕交易仍是 `NotImplementedError`，更像价格/指标回退源 |
+| `yfinance` | 行情、指标、基本面、资产负债表、现金流、利润表、新闻、全球新闻、内幕交易 | 兼容美股，也会把 `.SH` 映射成 `.SS`；对 A 股部分扩展数据无能为力 |
+| `alpha_vantage` | 行情、指标、财报、新闻、全球新闻、内幕交易 | 依赖 `ALPHA_VANTAGE_API_KEY`，并显式处理频率限制 |
+| `cn_stub` | 无 | 占位 provider，用来提醒调用方这不是可落地的数据源 |
+
+还有一个容易被忽略的细节：`default_config.py` 没有单独给 `cn_market_data` 配置默认 vendor，因此这类方法会先按 `get_vendor()` 的默认值走 `yfinance`，随后因为未实现而回退到 `cn_akshare`。从功能上看这没问题，但从配置清晰度看说明 A 股专用扩展数据仍有进一步显式化空间。
+
+### 5.3 `DataCollector`：把多源调用变成一次并行预抓取
+
+如果说 provider registry 解决的是“向谁要数据”，那么 [`tradingagents/graph/data_collector.py`](../tradingagents/graph/data_collector.py) 解决的是“何时一次性拿齐”。`DataCollector.collect()` 会并行预抓取：
+
+- 行情 `stock_data`
+- 个股新闻 `news`
+- 全球新闻 `global_news`
+- 板块资金流 `fund_flow_board`
+- 个股资金流 `fund_flow_individual`
+- 龙虎榜 `lhb`
+- 内幕交易 `insider_transactions`
+- 涨停池 `zt_pool`
+- 热门股票 `hot_stocks`
+- 10 项技术指标
+- 在非 `short_only` 模式下额外抓财报四件套
+
+这一步有两个设计收益：
+
+1. 多个 analyst 共用同一批缓存，减少对外部数据源的重复请求。
+2. 短线专用分析可以走 14 天窗口并跳过财报，降低首次启动延迟。
+
+当前实现里，`short_only=True` 只会在 `collect(..., horizons=['short'])` 时触发；否则默认走 90 天全量抓取。缓存键由 `ticker + trade_date` 组成，分析结束后通过 `evict()` 释放。
+
+这里还要注意一个事实：`DataCollector.get_window()` 只给缓存副本补上 `_data_window` 和 `_horizon` 元数据，不会真正切分底层 CSV 数据。因此系统的“短线/中线数据差异”主要体现在采集范围、提示词侧重点和 trace 标签，而不是在缓存层保存两份独立时间窗切片。
+
+### 5.4 模型接入：统一工厂封装多家 LLM Provider
+
+模型接入的统一入口在 [`tradingagents/llm_clients/factory.py`](../tradingagents/llm_clients/factory.py)。`TradingAgentsGraph` 初始化时会用同一套 provider 配置创建两个客户端：
+
+- `quick_thinking_llm`：给 analyst、辩论和信号处理等高频节点使用
+- `deep_thinking_llm`：给研究经理和风控裁决等收口节点使用
+
+也就是说，系统并不是“不同角色绑定不同云厂商”，而是“同一 provider 下的快模型和深模型分工”。当前 provider 映射如下：
+
+| `llm_provider` | 实际客户端 | 特点 |
+| --- | --- | --- |
+| `openai` | `OpenAIClient` | 直接接 OpenAI 兼容接口，可通过 `TA_BASE_URL` 指向代理或兼容网关 |
+| `ollama` | `OpenAIClient` | 复用 OpenAI 兼容协议，默认打到 `http://localhost:11434/v1` |
+| `openrouter` | `OpenAIClient` | 默认打到 `https://openrouter.ai/api/v1`，优先读 `OPENROUTER_API_KEY` |
+| `xai` | `OpenAIClient` | 默认打到 `https://api.x.ai/v1`，优先读 `XAI_API_KEY` |
+| `anthropic` | `AnthropicClient` | 直接返回 `ChatAnthropic` |
+| `google` | `GoogleClient` | 直接返回 `ChatGoogleGenerativeAI`，并做 Gemini 内容归一化 |
+
+其中有几个实现细节值得单独记住：
+
+1. [`tradingagents/llm_clients/openai_client.py`](../tradingagents/llm_clients/openai_client.py) 里的 `UnifiedChatOpenAI` 会对 `o1`、`o3`、`gpt-5` 一类 reasoning model 自动去掉 `temperature` 和 `top_p`，避免向不兼容模型传参。
+2. 同一个类还会在 `invoke()` 时对 OpenAI 兼容网关偶发的非 JSON 返回做重试，属于明显的“工程补丁”而不是框架默认行为。
+3. [`tradingagents/llm_clients/google_client.py`](../tradingagents/llm_clients/google_client.py) 会把 Gemini 返回的 `content: list[...]` 正规化为字符串，并把统一的 `thinking_level` 映射到 Gemini 3 的 `thinking_level` 或 Gemini 2.5 的 `thinking_budget`。
+4. [`tradingagents/llm_clients/anthropic_client.py`](../tradingagents/llm_clients/anthropic_client.py) 接受 `base_url` 参数，但当前并未使用；`tradingagents/llm_clients/TODO.md` 也明确把它列为待修正项。
+5. [`tradingagents/llm_clients/validators.py`](../tradingagents/llm_clients/validators.py) 维护了模型白名单，但 `validate_model()` 当前没有被实际调用，因此它更像“静态知识库”而不是运行时保护。
+
+提示词语言也是模型接入链的一部分。[`tradingagents/prompts/catalog.py`](../tradingagents/prompts/catalog.py) 会根据 `prompt_language` 或 `prompt_language_by_provider` 在中英文模板之间切换；默认配置是中文 `zh`。这意味着“换模型”与“换提示词语言”在这套系统里是解耦的。
+
+### 5.5 配置面：默认值、用户覆盖、请求覆盖三层叠加
+
+运行时配置的基础值来自 [`tradingagents/default_config.py`](../tradingagents/default_config.py)。从代码实际行为看，当前有效的配置优先级是：
+
+```text
+DEFAULT_CONFIG
+  -> 用户级配置（user_llm_configs 表）
+  -> 单次请求 config_overrides
+```
+
+`api/main.py` 里虽然还保留了 `_global_config_overrides` 变量和“PATCH /v1/config 全局覆盖”的注释，但当前路由并没有真正写入这个变量；现阶段真正生效的是“默认值 -> 用户数据库 -> 本次请求”三层。
+
+用户级配置入口是：
+
+- `GET /v1/config`
+- `PATCH /v1/config`
+
+这些接口会把 `llm_provider`、`deep_think_llm`、`quick_think_llm`、`backend_url`、辩论轮次和用户 API Key 写入 `user_llm_configs` 表。API Key 会先经过 [`api/services/auth_service.py`](../api/services/auth_service.py) 里的 `encrypt_secret()` 再落库，解密时使用 `APP_SECRET_KEY` 或 `SECRET_KEY` 作为主密钥。
+
+最值得优先掌握的环境变量如下：
+
+| 变量 | 来源 | 作用 |
+| --- | --- | --- |
+| `TA_LLM_PROVIDER` | `default_config.py` | 选择 provider，默认 `openai` |
+| `TA_LLM_DEEP` / `TA_LLM_QUICK` | `default_config.py` | 深思考/快思考模型名 |
+| `TA_BASE_URL` / `TA_API_KEY` | `default_config.py` | OpenAI 兼容基地址与统一 API Key |
+| `TA_MAX_DEBATE` / `TA_MAX_RISK` | `default_config.py` | 投研辩论与风控辩论轮次 |
+| `TA_LANGUAGE` | `default_config.py` | Prompt 语言，默认 `zh` |
+| `TA_TRACE` / `TRADINGAGENTS_PROVIDER_TRACE` | `default_config.py`、`interface.py` | 打印 provider 路由轨迹 |
+| `DATABASE_URL` | `api/database.py` | 默认 SQLite，可切换到其他 SQLAlchemy 支持的数据库 |
+| `CORS_ALLOW_ORIGINS` / `CORS_ALLOW_ORIGIN_REGEX` | `api/main.py` | 前端跨域白名单 |
+| `TA_MAX_WORKERS` | `api/main.py` | 后台分析线程池大小 |
+| `ALLOW_SERVER_LLM_FALLBACK` | `api/main.py` | 仅写入配置响应，当前尚未真正影响图执行分支 |
+| `ALPHA_VANTAGE_API_KEY` | `alpha_vantage_common.py` | Alpha Vantage 数据源密钥 |
+| `XAI_API_KEY` / `OPENROUTER_API_KEY` | `openai_client.py` | xAI、OpenRouter 专用密钥 |
+| `APP_SECRET_KEY` / `SECRET_KEY` | `auth_service.py` | JWT 与用户密钥加密主密钥 |
+| `MAIL_*` / `SMTP_*` | `auth_service.py` | 邮箱验证码发送配置 |
+
+一个最小的后端环境可以写成：
+
+```env
+TA_LLM_PROVIDER=openai
+TA_LLM_QUICK=gpt-4o-mini
+TA_LLM_DEEP=gpt-4o
+TA_BASE_URL=https://api.openai.com/v1
+TA_API_KEY=your-key
+DATABASE_URL=sqlite:///./tradingagents.db
+APP_SECRET_KEY=replace-this-in-production
+```
+
+还有两个和部署有关的现实差异需要直说：
+
+1. README 提到了复制 `.env.example`，但仓库当前并没有提交这个文件，真正可靠的配置来源仍然是 `default_config.py`、`api/main.py` 和 README 文本本身。
+2. 数据库依赖里虽然声明了 Alembic，但实际启动流程仍然是 `Base.metadata.create_all()` 加 `_ensure_report_schema()` 的轻量补丁；后者直接执行 `PRAGMA table_info(reports)`，对 SQLite 友好，但对 PostgreSQL 一类数据库只会打印 warning，而不是完整迁移。
+
+### 5.6 运行入口：API、前端和包脚本并存，但成熟度不同
+
+从代码和打包清单看，仓库现在至少暴露了四种运行入口：
+
+1. 直接跑 FastAPI：
+
+```bash
+uv run python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+2. 使用 `pyproject.toml` 里的 console script：
+
+```bash
+uv run tradingagents-api
+```
+
+它最终调用的是 `api.main:run()`，内部仍然是 `uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False)`。
+
+3. 前端开发模式：
+
+```bash
+npm --prefix frontend run dev
+```
+
+4. 前后端一体模式：只要 `frontend/dist` 存在，`api/main.py` 会自动挂载 `/assets` 并把其他未知路径回退到 `index.html`，因此生产环境可以只启动一个 Python 进程同时服务 API 和静态站点。
+
+这里最值得写进文档的不是“怎么跑”，而是“哪些入口已经对齐、哪些还在漂移”：
+
+- `tradingagents-api` 是真实存在的包脚本，因为 `api.main:run` 确实存在。
+- `tradingagents = "cli.main:app"` 这个脚本入口当前仍写在 `pyproject.toml` 中，但仓库没有顶层 `cli/` 包，因此它更像历史遗留配置，而不是当前可依赖的正式入口。
+- 顶层 `sh` 文件只是一条 Ralph 编排命令，不是产品运行脚本，不应把它当成部署入口。
+
+### 5.7 部署方式：本地分离、单容器一体化、前端静态托管
+
+从当前资产看，仓库实际支持三种部署姿势。
+
+第一种是本地开发分离部署：
+
+- 后端用 `uvicorn api.main:app`
+- 前端用 `vite`
+- 数据库默认落在本地 `tradingagents.db`
+- LangGraph checkpoint 落在仓库目录下的 `graph_checkpoints.db`
+- 详细分析日志落在 `eval_results/<ticker>/TradingAgentsStrategy_logs/`
+
+这种模式最适合调试数据源、模型和提示词，因为所有文件都直接写到本地磁盘，问题定位最直接。
+
+第二种是单容器一体化部署，对应 [`Dockerfile`](../Dockerfile)。它采用多阶段构建：
+
+1. `node:20-slim` 构建前端 `frontend/dist`
+2. `ghcr.io/astral-sh/uv:python3.10-bookworm-slim` 安装 Python 依赖
+3. 复制 `api/`、`tradingagents/` 和构建好的前端产物
+4. 用 `uv run python -m uvicorn api.main:app` 作为容器启动命令
+
+这个设计说明仓库当前默认的生产思路是“一个镜像同时托管前后端”，而不是前后端完全分治。对应的 GitHub Actions 也在 [`docker-publish.yml`](../.github/workflows/docker-publish.yml) 中只做一件事：为 `linux/amd64` 和 `linux/arm64` 构建并推送镜像到 GHCR。
+
+第三种是前端静态单独托管。`frontend/vercel.json` 已经给出一套 Vite + rewrite 的示例，把 `/v1/*`、`/healthz`、`/docs` 等路径反代到远端后端。但要注意两点：
+
+1. 当前 `destination` 指向的是一个硬编码的 Cloudflare Tunnel URL，不适合作为复用模板直接提交生产。
+2. 这说明前端从架构上可以独立部署，但仓库没有提供同等级的正式后端反代模板、`docker-compose.yml`、Helm chart 或 Kubernetes 清单。
+
+### 5.8 部署约束与运维含义：单机友好，水平扩展前还要补共享状态
+
+如果要把这套系统真正部署成稳定服务，不能只看 Dockerfile，还要看运行时状态放在哪里。当前代码里有三类关键状态仍然是进程内存级：
+
+- `api/main.py` 里的 `_jobs`
+- `api/main.py` 里的 `_job_events`
+- `api/services/backtest_service.py` 里的 `_backtest_jobs`
+
+这意味着：
+
+1. 分析任务状态和 SSE 事件流默认依赖单进程内存。
+2. 多实例部署后，任务轮询和事件订阅需要命中同一实例，或者改造成外部消息总线。
+3. SQLite 报告库、SQLite checkpoint 和本地 `eval_results/` 日志目录都默认写在本机磁盘，更适合单机或带持久卷的容器，而不是无状态横向扩容。
+
+换句话说，仓库现在已经具备“单机产品化交付”的全部零件，但距离“多副本弹性扩容”还差共享任务状态、正式迁移体系和统一对象存储这几块基础设施。
+
+### 5.9 这一章可以带走的结论
+
+理解第 5 章后，你应该能把这套系统的基础设施边界概括成三句话：
+
+1. 数据层的核心不是某一家 API，而是“统一工具名 + provider registry + 自动回退”的路由机制。
+2. 模型层的核心不是“支持多少云”，而是“同一 provider 下的快模型/深模型分工 + 一层适配补丁”。
+3. 部署层当前最成熟的是单机或单容器一体化运行；如果要做多实例生产化，还需要把进程内状态和 SQLite 依赖继续外移。
 
 <a id="chapter-6"></a>
 ## 第6章：全文审校与整合
