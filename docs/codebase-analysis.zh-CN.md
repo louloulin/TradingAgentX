@@ -193,7 +193,7 @@ cd frontend && npm run dev
 | 状态分组 | 代表字段 | 含义 |
 | --- | --- | --- |
 | 标的与市场上下文 | `company_of_interest`、`trade_date`、`instrument_context`、`market_context` | 标准化股票代码、市场归属、交易时段、分析模式、数据截止时间 |
-| 用户上下文 | `user_context`、`user_intent`、`workflow_context` | 用户的仓位、成本、风险偏好、自然语言意图解析结果、请求来源和已选 analyst |
+| 用户上下文 | `user_context`、`user_intent`、`workflow_context` | 调用方显式传入并标准化后的仓位/风险约束、自然语言意图解析结果、请求来源和已选 analyst |
 | 分析报告 | `market_report`、`sentiment_report`、`news_report`、`fundamentals_report`、`macro_report`、`smart_money_report` | 六个 analyst 的原始结论文本 |
 | 中间裁决 | `game_theory_report`、`game_theory_signals`、`investment_plan`、`trader_investment_plan` | 从情绪/主力博弈到研究经理计划，再到交易员可执行方案 |
 | 辩论状态 | `investment_debate_state`、`risk_debate_state`、`risk_feedback_state` | 记录 claim、轮次、焦点问题、是否需要打回重写 |
@@ -203,12 +203,12 @@ cd frontend && npm run dev
 
 1. 用 `infer_instrument_context()` 推断标的是 A 股还是美股，并补全交易所、币种和资产类型。
 2. 用 `build_market_context()` 推断当前是盘前、盘中、盘后、历史回看还是未来日期，从而决定 `analysis_mode` 与 `data_as_of`。
-3. 用 `normalize_user_context()` 清洗用户仓位、成本、止损比例等输入，再把“标的摘要 + 市场摘要 + 用户摘要”塞进 `messages` 作为所有角色共享的起始提示。
+3. 若调用方显式传入 `user_context`，就用 `normalize_user_context()` 清洗用户仓位、成本、止损比例等输入，再把“标的摘要 + 市场摘要 + 用户摘要”塞进 `messages` 作为所有角色共享的起始提示；若额外传入 `user_intent`，则原样保存在 `state["user_intent"]`。
 
-这种做法有两个好处：
+这种做法有两个直接效果：
 
 - 角色节点不需要自己重复判断“这是 A 股还是美股”“今天是盘前还是盘后”。
-- 后面的交易员和风控节点可以直接消费标准化后的用户约束，而不必重新解析自然语言。
+- 单周期入口 `propagate()` 可以把显式传入的用户约束直接送进交易员和风控提示词；但当前双周期入口 `propagate_async()` 只传了 `user_intent=user_intent`，没有同步传 `user_context=user_intent["user_context"]`，所以解析出的仓位/风险字段默认仍停留在 `user_intent` 中，不会自动进入 `build_agent_context_view()` 读取的 `state["user_context"]`。
 
 还有一个容易忽略的细节：`analyst_traces` 在状态类型上声明为 `Annotated[List[TraceItem], operator.add]`。这表示多个 analyst 并行执行时会按追加方式合并，不会相互覆盖。它本质上是给最终报告和调试链路准备的“轻量化结构化摘要”。
 
@@ -264,12 +264,14 @@ START
   - 若 `risk_feedback_state.revision_required` 为真，且 `retry_count` 未超过 `max_retries`，则打回 `Trader` 重写方案。
   - 否则结束图执行。
 
-这里还有一个实现层面的细节值得单独指出：图里虽然保留了 `tools_market`、`tools_news` 等 `ToolNode`，但当前 analyst 节点的主路径通常不会真的走到这些节点。原因有两个：
+这里还有一个实现层面的细节值得单独指出：图里虽然保留了 `tools_market`、`tools_news` 等 `ToolNode`，但按当前代码形态，这条 analyst -> `tools_*` -> analyst 的循环基本不会被走到。原因更接近“状态没有接上”，而不只是“调用频率低”：
 
-1. 当前 analyst 实现大多优先从 `DataCollector` 缓存读取数据，缺数据时才直接调用工具包装函数。
-2. 中文提示词又明确要求“严格基于提供的数据输出，不要继续请求工具”。
+1. 当前 analyst 节点返回的主要是 `market_report`、`news_report`、`analyst_traces` 之类的业务字段，并不会把 LLM 返回值写回 `state["messages"]`。
+2. `ConditionalLogic.should_continue_*()` 判断是否进入 `ToolNode` 时，只检查 `state["messages"][-1].tool_calls`。
+3. 由于初始 `messages` 只是 `Propagator` 写入的一条人类提示，且 analyst 节点不会覆盖这条消息，所以条件判断几乎总会落到 `"done"`。
+4. `DataCollector` 缓存优先和提示词里的“不要继续请求工具”约束，只是进一步强化了这条保留分支不会成为主路径。
 
-所以，当前版本的 `ToolNode` 更像是兼容旧式工具调用 prompt 和后续扩展的保留设计，而不是默认主执行链的高频路径。
+所以，当前版本的 `ToolNode` 更像是为旧式工具调用 prompt 或未来重接 `messages` 流保留的图结构，而不是现状下可正常触发的高频执行路径。
 
 ### 2.6 数据获取与双周期执行：短线、中线共用一套数据池
 
@@ -281,11 +283,9 @@ START
 双周期路径更能代表当前产品形态。其关键流程如下：
 
 1. 若用户给了自然语言 `query`，先调用 `parse_intent()` 提取 `ticker`、`horizons`、`focus_areas`、`specific_questions` 与 `user_context`。
-2. `DataCollector.collect()` 先把所需行情、新闻、全球新闻、板块资金、个股资金、龙虎榜、财务报表和技术指标并行抓完，缓存在内存里。
-3. 对每个 horizon，`Propagator.create_initial_state()` 会构建一份独立状态，但两份状态共享同一个数据缓存。
-4. 各 analyst 再根据 horizon 调整数据窗口：
-   - 短线常用 7 到 14 天窗口，强调技术面、舆情和近期事件。
-   - 中线常用 30 到 90 天窗口，强调基本面、财务报表和政策环境。
+2. `DataCollector.collect()` 先把所需行情、新闻、全球新闻、板块资金、个股资金、龙虎榜、财务报表和技术指标并行抓完，缓存在内存里。当前 `propagate_async()` 调它时没有传 `horizons`，因此默认走的是全量抓取，而不是 `horizons == ['short']` 时才会触发的 14 天 `short_only` 优化。
+3. 对每个 horizon，`Propagator.create_initial_state()` 会构建一份独立状态，并把解析结果存进 `user_intent`；但当前实现没有把 `user_intent["user_context"]` 同步到 `state["user_context"]`，所以双周期路径里的交易员/风控提示词默认看不到这些解析出的持仓字段。
+4. 各 analyst 会读取同一份缓存池，但 `DataCollector.get_window()` 目前主要只是给缓存副本补上 `_data_window` 和 `_horizon` 元数据，并不会按 horizon 真正裁切成两份不同的数据集。也就是说，双周期的差异主要体现在 prompt 侧重点、个别 analyst 的直连兜底抓取逻辑，以及 `analyst_traces` 里的窗口标签，而不是“同一缓存被切成两段不同时间窗”。
 5. 图执行完成后，`_build_horizon_result()` 从完整状态里提取双周期摘要，最终合成为 `short_term` 和 `medium_term` 两个结果块。
 6. 运行结束后，缓存通过 `DataCollector.evict()` 释放，避免长时间堆积。
 
@@ -305,7 +305,7 @@ print(result["short_term"]["final_trade_decision"])
 print(result["medium_term"]["final_trade_decision"])
 ```
 
-这个例子体现了第 2 章最核心的事实：系统不是只返回一个大段文本，而是先把用户意图解析成结构化上下文，再按不同时间维度各跑一遍同一张图。
+这个例子体现了第 2 章最核心的事实：系统不是只返回一个大段文本，而是先把用户意图解析成结构化结果并挂到 `user_intent`，再按不同时间维度各跑一遍同一张图。需要注意的是，当前双周期实现还没有把解析出的 `user_context` 自动桥接进交易员和风控节点读取的 `state["user_context"]`。
 
 ### 2.7 从请求进入到报告产出的主执行链
 
@@ -317,7 +317,7 @@ print(result["medium_term"]["final_trade_decision"])
 4. 六类 analyst 并行生成基础报告，并把各自结论压缩成 `analyst_traces`。
 5. `Game Theory Manager` 只消费情绪和主力资金两个维度，生成“主力 vs 散户”的博弈判断。
 6. `Bull Researcher` 与 `Bear Researcher` 围绕 `claim` 交替辩论，`Research Manager` 在达到轮次上限后收口并输出 `investment_plan`。
-7. `Trader` 把研究计划翻译成可执行交易方案，并显式纳入用户仓位、成本、风控反馈和历史记忆。
+7. `Trader` 把研究计划翻译成可执行交易方案，并显式纳入风控反馈和历史记忆；只有在单周期入口或调用方显式填充 `state["user_context"]` 时，用户仓位、成本和风险约束才会直接出现在它的上下文摘要里。
 8. 激进、保守、中性三位风控分析师围绕执行风险继续辩论，更新 `risk_debate_state`。
 9. `Risk Judge` 给出最终裁决，并写入 `risk_feedback_state`：
    - `pass`：直接结束。
