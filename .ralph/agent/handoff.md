@@ -1,11 +1,11 @@
 # Session Handoff
 
-_Generated: 2026-03-18 13:13:18 UTC_
+_Generated: 2026-03-18 14:17:46 UTC_
 
 ## Git Context
 
 - **Branch:** `main`
-- **HEAD:** e521506: chore: auto-commit before merge (loop primary)
+- **HEAD:** 00f9a87: chore: auto-commit before merge (loop primary)
 
 ## Tasks
 
@@ -26,9 +26,9 @@ _Generated: 2026-03-18 13:13:18 UTC_
 
 Recently modified:
 
+- `.ralph/agent/handoff.md`
 - `.ralph/agent/memories.md`
 - `.ralph/agent/memories.md.lock`
-- `.ralph/agent/scratchpad.md`
 - `.ralph/agent/summary.md`
 - `.ralph/agent/tasks.jsonl`
 - `.ralph/agent/tasks.jsonl.lock`
