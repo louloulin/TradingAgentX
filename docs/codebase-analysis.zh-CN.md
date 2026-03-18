@@ -526,7 +526,7 @@ APP_SECRET_KEY=replace-this-in-production
 
 还有两个和部署有关的现实差异需要直说：
 
-1. README 提到了复制 `.env.example`，但仓库当前并没有提交这个文件，真正可靠的配置来源仍然是 `default_config.py`、`api/main.py` 和 README 文本本身。
+1. README 提到了复制 `.env.example`，仓库根目录当前也确实提交了这个文件；不过它提供的是“最小可启动模板”，只覆盖核心模型接入和少量可选项，并没有穷举所有运行参数，所以排查完整配置行为时仍应回到 `default_config.py`、`api/main.py` 与具体 provider 实现。
 2. 数据库依赖里虽然声明了 Alembic，但实际启动流程仍然是 `Base.metadata.create_all()` 加 `_ensure_report_schema()` 的轻量补丁；后者直接执行 `PRAGMA table_info(reports)`，对 SQLite 友好，但对 PostgreSQL 一类数据库只会打印 warning，而不是完整迁移。
 
 ### 5.6 运行入口：API、前端和包脚本并存，但成熟度不同
