@@ -365,7 +365,211 @@ if __name__ == "__main__":
 <a id="chapter-3"></a>
 ## 第3章：后端 API、服务层与数据持久化
 
-> 待补充。
+第 3 章回答一个很实际的问题：第 2 章里的多智能体工作流，到了后端到底是以什么形态暴露给前端和第三方调用方的。当前后端实现主要集中在 [`api/main.py`](../api/main.py)、[`api/services/`](../api/services/) 和 [`api/database.py`](../api/database.py)：`main.py` 负责 HTTP 入口、鉴权与任务编排，`services/` 负责把认证、报告、Token 与回测逻辑从路由中抽离，`database.py` 则定义了当前真正持久化下来的数据边界。
+
+### 3.1 后端总装：一个 `FastAPI` 应用里同时承载入口、编排和部分运行时状态
+
+[`api/main.py`](../api/main.py) 不是单纯的“路由集合”，而是当前后端的总装文件。它在模块加载阶段完成了几件关键事情：
+
+1. `load_dotenv()` 读取环境变量。
+2. 在 `lifespan()` 启动钩子里调用 `init_db()` 初始化数据库表。
+3. 通过 `_cors_allow_origins()` 和 `_cors_allow_origin_regex()` 组装 CORS 配置。
+4. 创建 `ThreadPoolExecutor(max_workers=TA_MAX_WORKERS)`，把分析任务放进后台线程执行。
+5. 准备 `_jobs`、`_job_events`、`_cn_stock_map` 这几类进程内缓存与队列，用来维护任务状态、SSE 事件流和股票名称映射。
+
+这说明当前后端是“单体应用 + 轻量 service 层”的结构，而不是 `routers/`、`controllers/`、`services/`、`repositories/` 完整分层。优点是入口集中、调试直接；代价是 `main.py` 同时承担了协议适配、状态机驱动和一部分运行时状态管理，文件体量已经明显偏大。
+
+### 3.2 HTTP 面向哪些调用方：公开接口、分析接口、账号接口和内部辅助接口混在同一应用里
+
+从 [`api/main.py`](../api/main.py) 当前的装饰器分布看，路由可以按“面向谁”和“是否需要登录”分成下面几组：
+
+| 路由组 | 代表端点 | 是否鉴权 | 主要作用 |
+| --- | --- | --- | --- |
+| 健康与公共市场数据 | `GET /healthz`、`GET /v1/market/kline`、`GET /v1/market/hot-stocks` | 否 | 健康检查、K 线拉取、热门股列表 |
+| 登录入口 | `POST /v1/auth/request-code`、`POST /v1/auth/verify-code` | 否 | 发送邮箱验证码、换取网页登录 JWT |
+| 分析任务入口 | `POST /v1/analyze`、`POST /v1/chat/completions` | 是，允许 JWT 或 API Token | 提交分析任务，返回 `job_id` 或直接转成 SSE/Chat Completion 风格响应 |
+| 任务轮询与事件流 | `GET /v1/jobs/{job_id}`、`GET /v1/jobs/{job_id}/result`、`GET /v1/jobs/{job_id}/events` | 是，允许 JWT 或 API Token | 查询状态、取最终结果、订阅流式事件 |
+| 报告与公告 | `POST /v1/reports`、`GET /v1/reports`、`GET /v1/reports/{id}`、`DELETE /v1/reports/{id}`、`GET /v1/announcements/latest` | 是，允许 JWT 或 API Token | 管理历史报告、读取公告 |
+| 用户侧配置与 Token 管理 | `GET /v1/auth/me`、`GET/PATCH /v1/config`、`GET/POST/DELETE /v1/tokens` | 是，但只允许网页登录 JWT | 读取当前用户、更新模型配置、管理 API Token |
+| 回测接口 | `POST /v1/backtest`、`GET /v1/backtest`、`GET/DELETE /v1/backtest/{job_id}` | 否 | 提交和查看历史回测任务 |
+
+这里有三个实现上的关键信号：
+
+1. 市场数据查询和回测接口目前都是公开的，没有挂 `Depends(_require_api_user)`。
+2. 分析、报告与公告接口统一走 `_require_api_user`，既接受网页登录得到的 JWT，也接受 `ta-sk-` 前缀的 API Token。
+3. `GET /v1/auth/me`、`/v1/config` 和 `/v1/tokens` 则显式要求 `_require_web_user`，也就是前端网页端登录态可访问，但 API Token 不可访问。
+
+换句话说，后端实际上把“给网页自己用的账号能力”和“给程序调用的分析能力”放在了一套 API 里，只是依赖 `RequireUser(allow_api_token=...)` 做权限切分。
+
+### 3.3 核心执行链：`/v1/analyze` 与 `/v1/chat/completions` 最终都会落到 `_run_job()`
+
+后端真正的主链不是某一个路由函数，而是 [`api/main.py`](../api/main.py) 里的 `_run_job()`。`POST /v1/analyze` 和 `POST /v1/chat/completions` 都先做外层协议适配，再把真正的执行工作扔给后台线程。
+
+它们的共同骨架如下：
+
+1. 创建 `job_id`，往 `_jobs` 内存字典写入 `pending` 状态。
+2. 为该任务准备 `_job_events[job_id]` 队列，供 SSE 输出使用。
+3. 调用 `_executor.submit(_run_job, ...)`，把真正分析放进线程池。
+4. 客户端随后通过 `GET /v1/jobs/{job_id}` 轮询，或通过 `GET /v1/jobs/{job_id}/events` 订阅 `text/event-stream`。
+
+`/v1/chat/completions` 比 `/v1/analyze` 额外多做了一层“自然语言入口适配”：
+
+- 先用 `_extract_chat_text()` 把 Chat 消息拼成用户文本。
+- 再用 `_ai_extract_symbol_and_date()` 调一次快模型，识别股票、日期、周期、关注点和 `user_context`。
+- 然后把这些解析结果折叠成 `AnalyzeRequest`，继续交给 `_run_job()`。
+
+因此它本质上不是“另一套分析逻辑”，而是 OpenAI 兼容聊天协议对现有分析任务系统的一层包装。
+
+如果要从终端手工走一遍这条链，最短路径如下：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/auth/request-code \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dev@example.com"}'
+
+curl -s http://127.0.0.1:8000/v1/auth/verify-code \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dev@example.com","code":"123456"}'
+
+curl -s http://127.0.0.1:8000/v1/analyze \
+  -H 'Authorization: Bearer <access_token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"600519.SH","trade_date":"2026-03-18","selected_analysts":["market","news","fundamentals"]}'
+
+curl -N http://127.0.0.1:8000/v1/jobs/<job_id>/events \
+  -H 'Authorization: Bearer <access_token>'
+```
+
+要注意第一步在开发环境下只有“未配置 SMTP 或发送失败且 `APP_ENV != production`”时才会把 `dev_code` 回给调用方；生产模式默认不会在 HTTP 响应里回显验证码。
+
+### 3.4 `_run_job()` 做的不是单次推理，而是一条“任务登记 -> 图执行 -> 增量落库 -> 结果收口”流水线
+
+`_run_job()` 的实现很好地体现了这一层的真实职责：后端并不直接做投研分析，而是负责把第 2 章的图执行包装成一个可观察、可恢复一部分状态、可流式输出的任务。
+
+#### 3.4.1 任务启动时先写报告表，再更新进程内状态
+
+函数一开始就会：
+
+1. 用 `SessionLocal()` 创建数据库会话。
+2. 调用 `report_service.init_report()` 先插入一条 `reports` 记录，状态为 `pending`。
+3. 再调用 `report_service.update_report_partial(..., status="running")` 把记录更新为 `running`。
+4. 即使这一步失败，也只打印日志，不中止主任务。
+
+这意味着数据库在这里承担的是“任务外显”和“结果留痕”，而不是硬依赖的事务总线。即便数据库不可用，图执行仍会继续，只是前端的报告可见性和历史记录会缺失。
+
+#### 3.4.2 单周期与双周期入口共享同一个执行外壳
+
+`_run_job()` 内部分成三条支路：
+
+- `dry_run`：不调用图，只回显配置和请求摘要。
+- `request.query` 存在：走双周期、意图驱动路径。
+- 其他情况：走普通单周期路径。
+
+双周期路径会先构造 `user_intent`，再调用 `graph.data_collector.collect()` 做一次共享数据预抓取，然后按 `short`、`medium` 两个周期分别构建 `TradingAgentsGraph` 并执行 `graph.stream()`。两个周期结束后，后端再自行选择主周期结果并调用 `graph.process_signal(...)` 得出 `decision`。
+
+这里有一个很重要的分工边界：在双周期 API 路径里，最终交易信号不是 `propagate_async()` 自动返回给外部的，而是 API 层在聚合完 `primary_r` 之后再调用 `graph.process_signal(...)` 收口。这个细节和第 2 章讨论的图内执行职责是一一对应的。
+
+#### 3.4.3 流式输出与增量落库是并行发生的
+
+无论单周期还是双周期，`_run_job()` 都在消费 `graph.graph.stream(...)` 产生的 chunk。每拿到一个 chunk，它会同时做三件事：
+
+1. 更新 `AgentProgressTracker`，把 analyst、研究团队、交易员和风控团队的状态推进成 `pending / in_progress / completed / skipped`。
+2. 通过 `_emit_job_event()` 往 `_job_events[job_id]` 队列里塞 `agent.status`、`agent.report.chunk`、`agent.tool_call`、`job.completed` 等 SSE 事件。
+3. 发现新的 `market_report`、`news_report`、`investment_plan` 等文本段时，调用 `report_service.update_report_partial()` 立即把分段报告写回 `reports` 表。
+
+这说明后端当前采用的是“边生成、边推送、边落库”的交错模型，而不是等整个图执行完成后一次性保存全部结果。它的直接收益是：
+
+- 前端可以在任务进行中看到局部研报内容。
+- 任务中途失败时，数据库里仍可能保留已经产出的部分段落。
+- 审计和复盘时可以看到报告是如何逐段形成的。
+
+但它也带来了明显的运行时约束：SSE 通道是否正常关闭，依赖 `_set_job(status="completed")` 和 `job.completed` 事件的顺序。代码里已经显式注释，要求结构化提取和最终写库必须先完成，再把 `_jobs[job_id]["status"]` 置成 `completed`，否则 `_stream_job_events()` 可能会在看到状态完成后提前结束流。
+
+#### 3.4.4 结构化提取发生在图外、落库前
+
+图返回的是长文本报告，真正写入 `confidence`、`target_price`、`stop_loss_price`、`risk_items`、`key_metrics` 这些结构化字段时，后端还会额外调用 [`api/services/report_service.py`](../api/services/report_service.py)：
+
+1. `extract_structured_data()` 优先走 LLM `with_structured_output(StructuredReport)`。
+2. 如果结构化提取失败，则回退到 `_extract_confidence_regex()`、`_extract_price_regex()` 和 `_extract_verdict()` 这些正则逻辑。
+3. `resolve_report_fields()` 再把长文本里的方向、价格、关键报告段、研究计划统一解析成一组可写库字段。
+4. 最后由 `create_report(..., report_id=job_id)` 把同一条 `reports` 记录收口为 `completed`。
+
+因此 `report_service` 不是简单 CRUD，而是“报告二次加工 + 数据模型规范化”的服务层。
+
+### 3.5 鉴权与 service 层职责：已经有抽离，但还不是完全独立的领域服务
+
+当前 `api/services/` 下有四个服务模块，它们和 `main.py` 的关系更像“领域辅助器”，不是把全部业务完全搬走。
+
+| Service | 主要职责 | 关键实现细节 |
+| --- | --- | --- |
+| [`auth_service.py`](../api/services/auth_service.py) | 邮箱验证码登录、JWT 签发、用户配置加密存取 | 验证码只存 `code_hash`；JWT 使用 `APP_SECRET_KEY` / `SECRET_KEY`；用户 API Key 用基于同一 secret 派生的 Fernet 加密后写入 `user_llm_configs` |
+| [`report_service.py`](../api/services/report_service.py) | 报告初始化、分段更新、最终收口、结构化字段提取 | 既负责 DB CRUD，也负责从长文本里抽取方向、置信度、目标价、止损价、风险项和指标 |
+| [`token_service.py`](../api/services/token_service.py) | API Token 创建、列举、删除、校验 | Token 目前以明文形式存入 `user_tokens.token`，校验时直接比对；同时会更新 `last_used_at` |
+| [`backtest_service.py`](../api/services/backtest_service.py) | 提交历史回测、后台线程执行、统计收益 | 完全复用 `TradingAgentsGraph.propagate()`，但结果只放在进程内 `_backtest_jobs` 字典中，没有数据库表 |
+
+其中认证链路最值得单独说明，因为它和权限模型直接相关：
+
+1. `request-code` 调 `upsert_login_code()`，会把旧的未消费验证码标记为 `consumed_at=now`，然后插入新验证码。
+2. `verify-code` 调 `verify_login_code()`，验证码正确时若用户不存在会自动创建 `UserDB`。
+3. 登录成功后返回 JWT；之后 `RequireUser` 会优先尝试把 Bearer Token 当作 JWT 解码，失败后若 `allow_api_token=True` 再尝试 `token_service.verify_token()`。
+
+这种“JWT 优先、API Token 兜底”的策略，让分析类接口既能被网页登录后的前端调用，也能被脚本或第三方集成稳定复用。
+
+运行时配置也和鉴权直接绑定。`GET/PATCH /v1/config` 实际读写的是 `user_llm_configs` 表，真正持久化的是“按用户覆盖默认配置”的那一层；虽然 `main.py` 里还保留了 `_global_config_overrides` 变量和相关注释，但当前路由并没有把 `PATCH /v1/config` 写入这个全局字典，而是调用 `auth_service.upsert_user_llm_config()` 把变更保存到用户表。这和第 5 章讨论的配置优先级实现是一致的。
+
+### 3.6 数据库到底存了什么：用户、令牌、验证码、用户配置和报告；任务队列本身没有入库
+
+[`api/database.py`](../api/database.py) 使用的是 SQLAlchemy 原生 `declarative_base()`，不是 SQLModel。它当前定义了五张表：
+
+| 表 | 模型 | 存储内容 |
+| --- | --- | --- |
+| `reports` | `ReportDB` | 报告主记录、结构化决策字段、各 analyst 的全文段落、完整 `result_data` JSON |
+| `users` | `UserDB` | 用户邮箱、启用状态、登录时间 |
+| `email_verification_codes` | `EmailVerificationCodeDB` | 邮箱验证码哈希、用途、过期时间、消费时间 |
+| `user_llm_configs` | `UserLLMConfigDB` | 用户私有模型配置、后端地址、加密后的 API Key |
+| `user_tokens` | `UserTokenDB` | API Token、名称、启用状态、最近使用时间 |
+
+`reports` 是最重的一张表，因为它同时承担三层语义：
+
+1. 任务生命周期：`pending / running / completed / failed`。
+2. 结构化决策摘要：`decision`、`direction`、`confidence`、`target_price`、`stop_loss_price`、`risk_items`、`key_metrics`、`analyst_traces`。
+3. 报告全文镜像：`market_report`、`news_report`、`fundamentals_report`、`investment_plan`、`final_trade_decision` 以及完整 `result_data` JSON。
+
+这是一种典型的“查询友好冗余”设计：一方面保留 `result_data` 方便后续扩展，另一方面把高频字段拆成独立列，便于列表页和详情页直接读取。
+
+### 3.7 当前持久化边界：数据库只负责慢变量，任务状态、SSE 队列和回测结果仍是进程内内存
+
+这一章最容易被误解的地方是“系统看起来有任务、有回测、有实时进度，所以是不是都落库了”。答案是否定的。当前真正持久化和未持久化的边界很清楚：
+
+| 运行时对象 | 存放位置 | 是否持久化 | 含义 |
+| --- | --- | --- | --- |
+| 用户、验证码、用户配置、API Token | `api/database.py` 定义的表 | 是 | 账号体系与长期配置 |
+| 报告正文、结构化结果、任务最终状态 | `reports` 表 | 是 | 历史查询与报告页回放 |
+| `_jobs` | `api/main.py` 进程内字典 | 否 | 当前任务的即时状态、错误栈、最终 result 缓存 |
+| `_job_events` | `api/main.py` 进程内 `queue.Queue` | 否 | SSE 事件流缓存 |
+| `_backtest_jobs` | `backtest_service.py` 进程内字典 | 否 | 回测任务与收益记录 |
+| `_cn_stock_map` | `api/main.py` 进程内缓存 | 否 | 股票名称到代码映射 |
+
+这带来几个很具体的工程含义：
+
+1. 只要进程重启，`/v1/jobs/{job_id}` 的即时状态和 `/v1/jobs/{job_id}/events` 的事件队列就会消失，但已经写入 `reports` 的报告内容仍在。
+2. 回测结果完全不进数据库，所以重启后 `/v1/backtest` 历史会清空，也无法按用户隔离。
+3. 当前 API 更适合单机部署或轻量自托管；如果后续要做多实例扩容，就需要把 job store、event bus 和 backtest store 从内存迁到共享存储。
+
+数据库初始化方式本身也暴露了当前演进阶段：`init_db()` 只调用 `Base.metadata.create_all()`，再额外执行 `_ensure_report_schema()`；后者通过 `PRAGMA table_info(reports)` 和 `ALTER TABLE` 给旧 SQLite 部署补列。也就是说，这里还没有 Alembic 之类的正式迁移链，且这套“补列”逻辑明显偏向 SQLite 兼容场景。
+
+再加上 SQLite 连接专门设置了 `check_same_thread=False`，可以看出当前持久化层的设计目标是“先把单机线程池 + 本地数据库跑顺”，而不是先优化分布式一致性。
+
+### 3.8 这一章可以带走的结论
+
+第 3 章可以压缩成四个判断：
+
+1. 后端真正的业务核心不是某个 REST 端点，而是 `_run_job()` 这一层对 LangGraph 执行的任务包装。
+2. `api/services/` 已经把认证、报告、Token 和回测逻辑抽出了一部分，但 HTTP 编排、SSE 推流和大量运行时状态仍集中在 [`api/main.py`](../api/main.py)。
+3. `api/database.py` 持久化的是“用户与报告这类慢变量”，不是整个运行时；任务状态、事件流和回测结果现在仍是进程内对象。
+4. 这套后端更像一台“单机可观测的投研工作站”，而不是已经完成水平扩展改造的多节点服务。
+
+理解了这些边界，再去看[第 4 章](#chapter-4)的前端状态管理，会更容易理解为什么前端一部分页面依赖实时 SSE，一部分页面则直接回读历史报告；而模型配置、环境变量和部署约束则继续放到[第 5 章](#chapter-5)展开。
 
 <a id="chapter-4"></a>
 ## 第4章：前端页面、状态管理与交互链路
