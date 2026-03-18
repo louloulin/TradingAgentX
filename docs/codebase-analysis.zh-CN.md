@@ -220,11 +220,11 @@ cd frontend && npm run dev
 2. 注入周期视角：`build_horizon_context()` 会把短线/中线、关注点和具体问题拼进每个角色的系统提示。
 3. 输出机读块：多个节点在正文结尾追加 HTML 注释，供图路由和状态归档解析。
 
-当前代码实际依赖的机读块如下：
+当前代码里，部分节点会生成下面这些机读块，但“会生成”和“会被程序结构化解析”并不完全等价：
 
 | 机读标记 | 生产节点 | 作用 |
 | --- | --- | --- |
-| `<!-- VERDICT: {...} -->` | 各 analyst、研究经理、交易员、风控裁决 | 提取方向性摘要，写入 `analyst_traces` 或供信号处理使用 |
+| `<!-- VERDICT: {...} -->` | 各 analyst、研究经理、交易员、`Risk Judge` | 当前真正会被程序结构化解析的主要是两处：各 analyst 的 `VERDICT` 会被提取进 `analyst_traces`；最终决策文本里的 `VERDICT` 会被 `SignalProcessor` 用来提炼 `BUY / SELL / HOLD`。研究经理和交易员即使输出该块，当前也没有独立解析逻辑 |
 | `<!-- GAME_THEORY: {...} -->` | `Game Theory Manager` | 产出结构化博弈信号，供研究经理收口 |
 | `<!-- DEBATE_STATE: {...} -->` | 多头/空头研究员 | 更新投资辩论里的 claim、焦点 claim、轮次摘要和下轮目标 |
 | `<!-- RISK_STATE: {...} -->` | 激进/保守/中性风控分析师 | 更新风险辩论里的 claim 和下一轮聚焦问题 |
@@ -292,17 +292,25 @@ START
 最小调用示例如下：
 
 ```python
+import asyncio
+
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-graph = TradingAgentsGraph(debug=False)
-result = await graph.propagate_async(
-    company_name="600519",
-    trade_date="2026-03-18",
-    query="我半仓持有 600519，成本 1500，偏保守，想看短线和中线怎么操作。",
-)
 
-print(result["short_term"]["final_trade_decision"])
-print(result["medium_term"]["final_trade_decision"])
+async def main():
+    graph = TradingAgentsGraph(debug=False)
+    result = await graph.propagate_async(
+        company_name="600519",
+        trade_date="2026-03-18",
+        query="我半仓持有 600519，成本 1500，偏保守，想看短线和中线怎么操作。",
+    )
+
+    print(result["short_term"]["final_trade_decision"])
+    print(result["medium_term"]["final_trade_decision"])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 这个例子体现了第 2 章最核心的事实：系统不是只返回一个大段文本，而是先把用户意图解析成结构化结果并挂到 `user_intent`，再按不同时间维度各跑一遍同一张图。需要注意的是，当前双周期实现还没有把解析出的 `user_context` 自动桥接进交易员和风控节点读取的 `state["user_context"]`。
@@ -323,7 +331,9 @@ print(result["medium_term"]["final_trade_decision"])
    - `pass`：直接结束。
    - `revise`：把硬约束和修订原因打回给 `Trader`，允许一次重写。
    - `reject`：结束并保留否决意见。
-10. `TradingAgentsGraph` 把结果记录到 `eval_results/<ticker>/TradingAgentsStrategy_logs/`，并通过 `SignalProcessor` 从长文本中再提炼一次 `BUY / SELL / HOLD`。
+10. 结果会记录到 `eval_results/<ticker>/TradingAgentsStrategy_logs/`，但信号提炼的归属要按入口区分：
+   - 单周期入口 `propagate()` 会在返回前直接调用 `SignalProcessor`，把 `final_trade_decision` 再提炼成 `BUY / SELL / HOLD`。
+   - 双周期入口 `propagate_async()` 只返回 `short_term` / `medium_term` 结果并记录双周期日志；当前 API 层会在 `api/main.py` 里选定主 horizon 后，再显式调用 `graph.process_signal(...)`。
 
 用一张简化图表示，就是：
 
@@ -338,7 +348,8 @@ print(result["medium_term"]["final_trade_decision"])
   -> 交易员生成执行方案
   -> 三方风控辩论
   -> 风控裁决
-  -> 记录日志、输出最终报告与 BUY/SELL/HOLD
+  -> 记录日志、输出最终报告
+  -> 由单周期图入口或双周期 API 收口步骤补充 BUY/SELL/HOLD
 ```
 
 ### 2.8 这一章可以带走的结论
