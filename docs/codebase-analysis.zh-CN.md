@@ -574,7 +574,308 @@ curl -N http://127.0.0.1:8000/v1/jobs/<job_id>/events \
 <a id="chapter-4"></a>
 ## 第4章：前端页面、状态管理与交互链路
 
-> 待补充。
+第 4 章回答一个很实际的问题：用户从打开网页到看到最终研报，整个前端到底是怎么组织的。前两章已经解释了多智能体引擎和后端 API；本章则把 `frontend/src/` 里的页面结构、状态管理、API 调用、SSE 实时通道和关键交互组件串成一条完整的“用户视角链路”。
+
+### 4.1 前端总装：React 18 + TypeScript + Vite + Zustand
+
+[`frontend/package.json`](../frontend/package.json) 列出了前端的核心技术栈：
+
+| 层次 | 技术选型 | 作用 |
+| --- | --- | --- |
+| 框架 | React 18 | 组件化 UI 渲染 |
+| 语言 | TypeScript 5 | 类型安全与 IDE 支持 |
+| 构建 | Vite 5 | 快速开发服务器与生产构建 |
+| 路由 | React Router 6 | 页面导航与 URL 参数解析 |
+| 状态 | Zustand 4 | 轻量级全局状态管理 |
+| 样式 | Tailwind CSS 3 | 原子化 CSS 样式 |
+| 图表 | lightweight-charts 5、recharts 2 | K 线图与数据可视化 |
+| Markdown | react-markdown + remark-gfm | 研报渲染 |
+| 工具 | lucide-react、date-fns、clsx | 图标、日期、类名拼接 |
+
+这套选型的核心特征是“轻量但不简陋”：Zustand 替代 Redux，Tailwind 替代 CSS-in-JS，lightweight-charts 处理金融图表。前端不依赖复杂的状态管理框架，状态全集中在两个 store 里，配合 React Hooks 可以直接在任何组件里读写全局状态。
+
+### 4.2 页面结构与路由体系
+
+[`frontend/src/App.tsx`](../frontend/src/App.tsx) 定义了完整的路由树：
+
+```text
+/                   -> Dashboard
+/analysis           -> Analysis（分析主页面）
+/reports            -> Reports（历史报告）
+/portfolio          -> Portfolio（组合管理）
+/backtest           -> Backtest（回测页面）
+/settings           -> Settings（设置页面）
+/login              -> Login（登录页面）
+```
+
+所有带导航的页面都被 `<Layout>` 包裹，它提供 Sidebar 和 Header。路由层还嵌入了 `RequireAuth` 高阶组件：未登录用户会被重定向到 `/login`。登录态的持久化通过 `localStorage` 实现，`hydrate()` 时会调 `/v1/auth/me` 验证 token 有效性。
+
+页面之间的职责划分如下：
+
+| 页面 | 主要职责 | 关键交互 |
+| --- | --- | --- |
+| `Dashboard` | 首页概览、公告、热门股 | 快捷入口、股票跳转 |
+| `Analysis` | 分析主页面、协同工作流、报告查看 | 发起分析、查看实时进度、阅读研报 |
+| `Reports` | 历史报告列表与详情 | 报告查询、详情回放 |
+| `Portfolio` | 持仓组合管理 | 组合配置、收益查看 |
+| `Backtest` | 历史回测 | 提交回测、查看收益曲线 |
+| `Settings` | 用户配置、API Token 管理 | 模型配置、Token CRUD |
+
+### 4.3 状态管理层：两个核心 Store 覆盖认证与业务
+
+前端状态管理集中在两个 Zustand store 里。
+
+#### 4.3.1 `authStore`：认证状态与登录态持久化
+
+[`frontend/src/stores/authStore.ts`](../frontend/src/stores/authStore.ts) 管理用户登录态：
+
+```typescript
+interface AuthState {
+    user: AuthUser | null
+    token: string | null
+    loading: boolean
+    hydrated: boolean
+    setAuth: (token: string, user: AuthUser) => void
+    logout: () => void
+    hydrate: () => Promise<void>
+}
+```
+
+关键行为：
+
+1. `setAuth()` 把 token 和用户信息写入 `localStorage`，并调用 `analysisStore.clearSession()` 重置分析状态。
+2. `hydrate()` 在 `RequireAuth` 挂载时触发：先从 `localStorage` 读 token，再调 `/v1/auth/me` 验证；若验证失败则清空本地状态并重定向登录。
+3. `logout()` 同时清理 `localStorage` 和两个 store 的状态。
+
+这意味着登录态是“双写”：内存里的 `token` 和 `user` 负责运行时消费，`localStorage` 负责页面刷新后恢复。
+
+#### 4.3.2 `analysisStore`：分析任务、报告与实时状态的全局容器
+
+[`frontend/src/stores/analysisStore.ts`](../frontend/src/stores/analysisStore.ts) 是前端最核心的状态中心。它定义了 15 个智能体的初始状态、报告结构、聊天消息、流式输出缓冲和结构化数据提取结果。
+
+关键字段分组：
+
+| 分组 | 字段 | 含义 |
+| --- | --- | --- |
+| 任务上下文 | `currentJobId`、`currentSymbol`、`jobStatus` | 当前任务 ID、标的代码、运行状态 |
+| 智能体状态 | `agents`、`isAnalyzing`、`isConnected` | 15 个智能体的实时状态、是否在分析、是否已连接 SSE |
+| 报告数据 | `report`、`streamingSections` | 完整报告对象、流式输出缓冲（支持打字机效果） |
+| 结构化提取 | `riskItems`、`keyMetrics`、`jobConfidence`、`jobTargetPrice`、`jobStopLoss` | LLM 提取的风险项、关键指标、置信度、目标价、止损价 |
+| 对话历史 | `chatMessages`、`milestones` | 持久化的聊天记录、分析里程碑事件 |
+| 周期标识 | `currentHorizon` | 当前分析的周期（`short` 或 `medium`） |
+
+`analysisStore` 还配置了 `persist` 中间件，只把部分字段写入 `localStorage`：
+
+```typescript
+partialize: (state) => ({
+    currentSymbol: state.currentSymbol,
+    report: state.report,
+    riskItems: state.riskItems,
+    keyMetrics: state.keyMetrics,
+    jobConfidence: state.jobConfidence,
+    jobTargetPrice: state.jobTargetPrice,
+    jobStopLoss: state.jobStopLoss,
+    chatMessages: state.chatMessages,
+})
+```
+
+这说明 `report`、`聊天历史` 和 `结构化提取结果` 会跨会话保留，但 `jobId`、`agents` 状态和 `streamingSections` 则在每次页面刷新后重置。这是合理的，因为任务进度是“实时快照”，不适合持久化。
+
+### 4.4 API 层：统一的 `ApiService` 封装所有后端调用
+
+[`frontend/src/services/api.ts`](../frontend/src/services/api.ts) 是前端唯一的 HTTP 入口。它用类封装，方法分为五组：
+
+| 组别 | 方法 | 对应后端接口 |
+| --- | --- | --- |
+| 分析入口 | `startAnalysis()`、`getJobStatus()`、`getJobResult()`、`chatCompletion()` | `POST /v1/analyze`、`GET /v1/jobs/{job_id}`、`POST /v1/chat/completions` |
+| 报告管理 | `getReports()`、`getReport()`、`deleteReport()`、`createReport()` | `GET /v1/reports`、`GET /v1/reports/{id}`、`DELETE /v1/reports/{id}`、`POST /v1/reports` |
+| 认证 | `requestLoginCode()`、`verifyLoginCode()`、`getMe()` | `POST /v1/auth/request-code`、`POST /v1/auth/verify-code`、`GET /v1/auth/me` |
+| 配置 | `getConfig()`、`updateConfig()` | `GET /v1/config`、`PATCH /v1/config` |
+| Token 管理 | `getTokens()`、`createToken()`、`deleteToken()` | `GET /v1/tokens`、`POST /v1/tokens`、`DELETE /v1/tokens/{id}` |
+| 市场数据 | `getKline()`、`getHotStocks()`、`getLatestAnnouncement()` | `GET /v1/market/kline`、`GET /v1/market/hot-stocks`、`GET /v1/announcements/latest` |
+
+`request()` 私有方法统一处理认证头、错误解析和 JSON 响应。Base URL 的解析逻辑是：
+
+1. 优先读 `VITE_API_URL` 环境变量。
+2. 若无，则使用当前浏览器页面的 `origin`（适配前后端同域部署）。
+3. 若仍无，返回 `http://localhost:8000` 作为开发默认值。
+
+### 4.5 SSE 实时通道：`useSSE` Hook 把后端事件流映射到状态更新
+
+[`frontend/src/hooks/useSSE.ts`](../frontend/src/hooks/useSSE.ts) 是前端实时感知后端分析进度的核心机制。它建立 `EventSource` 到 `/v1/jobs/{job_id}/events`，并把后端发送的命名 SSE 事件映射到 `analysisStore` 的状态更新。
+
+当前实现能处理 11 种 SSE 事件类型：
+
+| 事件类型 | 处理逻辑 | 更新到 Store |
+| --- | --- | --- |
+| `job.created` | 记录日志 | `addLog()` |
+| `job.running` | 设置分析状态为 true | `setIsAnalyzing(true)` |
+| `job.completed` | 写入完整报告和结构化数据 | `setReport()`、`setStructuredData()` |
+| `job.failed` | 记录错误日志 | `addLog()` |
+| `agent.status` | 更新单个智能体状态 | `updateAgentStatus()` |
+| `agent.snapshot` | 批量更新所有智能体快照 | `updateAgentSnapshot()` |
+| `agent.message` | 记录智能体消息（当前已禁用） | `addAgentMessage()`（空操作） |
+| `agent.tool_call` | 记录工具调用（当前已禁用） | `addAgentToolCall()`（空操作） |
+| `agent.report` | 更新分段报告内容 | `addAgentReport()` |
+| `done` / `[DONE]` | 关闭连接、重置状态 | `disconnect()` |
+
+有几个实现细节值得注意：
+
+1. 连接失败后会等待 3 秒自动重连。
+2. `ping` 事件被忽略，只用于保持 HTTP 连接存活。
+3. `agent.message` 和 `agent.tool_call` 已在 `analysisStore` 里实现为空操作（注释标注“消息已移至后端日志”），但 SSE 通道本身仍会接收这些事件。
+4. `addReportChunk` 实现了增量追加逻辑，支持报告分段到达时的打字机效果。
+
+### 4.6 关键交互组件：从聊天输入到研报展示的完整链路
+
+#### 4.6.1 `ChatCopilotPanel`：自然语言入口与股票识别
+
+分析页面的左侧面板负责接收用户的自然语言输入。它支持两种输入模式：
+
+1. 直接输入股票代码和日期，如 `分析贵州茅台 2026-03-18`。
+2. 输入自然语言查询，如 `我半仓持有 600519，成本 1500，想看看短线和中线怎么操作`。
+
+输入会通过 `api.chatCompletion()` 发送到 `/v1/chat/completions`。这个接口会在后端调用快模型做意图解析和股票识别，然后把结果转发给 `POST /v1/analyze`。SSE 通道建立后，`useSSE` 会持续接收 `agent.status` 和 `agent.report` 事件，驱动 `AgentCollaboration` 组件的状态更新。
+
+#### 4.6.2 `AgentCollaboration`：智能体协同工作流可视化
+
+[`frontend/src/components/AgentCollaboration.tsx`](../frontend/src/components/AgentCollaboration.tsx) 是分析页面最核心的可视化组件。它按五层结构展示 15 个智能体的实时状态：
+
+```text
+分析团队（6 个 Analyst）
+  -> 博弈裁判（1 个 Game Theory Manager）
+    -> 多空辩论（3 个角色：Bull/Bear Researcher + Research Manager）
+      -> 交易执行（1 个 Trader）
+        -> 风控裁决（4 个角色：Aggressive/Neutral/Conservative Analyst + Portfolio Manager）
+```
+
+每个智能体卡片显示：
+- 当前状态：`pending` / `in_progress` / `completed` / `skipped` / `error`
+- 角色标签（如“技术面”、“多头”、“稳健”）
+- 分析目标（如“技术指标与价格形态分析”）
+- 流式报告内容或已完成摘要
+
+状态流转通过 Tailwind 类名驱动样式变化：`pending` 是灰色、`in_progress` 是蓝色脉冲动画、`completed` 是绿色。
+
+#### 4.6.3 `KlinePanel`：行情数据展示
+
+K 线面板调用 `api.getKline(symbol)` 获取历史行情数据，用 `lightweight-charts` 渲染蜡烛图。它支持：
+- 标的切换（自动同步到 `analysisStore.currentSymbol`）
+- 日期范围过滤
+- 多周期切换（如果有的话）
+
+#### 4.6.4 `DecisionCard`、`RiskRadar`、`KeyMetrics`：结构化决策卡片
+
+这三个组件展示后端 LLM 提取的结构化数据：
+
+| 组件 | 展示内容 | 数据来源 |
+| --- | --- | --- |
+| `DecisionCard` | 交易决策（BUY/SELL/HOLD）、方向、置信度、目标价、止损价 | `analysisStore.report.decision` + 正则解析 |
+| `RiskRadar` | 风险项列表，按高中低分级渲染 | `analysisStore.riskItems` |
+| `KeyMetrics` | 关键指标卡片，按好坏状态着色 | `analysisStore.keyMetrics` |
+
+结构化数据有两条获取路径：
+
+1. **主路径**：`job.completed` 事件通过 `setStructuredData()` 写入 `analysisStore`（来自后端 LLM 结构化提取）。
+2. **兜底路径**：`Analysis.tsx` 在没有 LLM 提取结果时，用正则从 `final_trade_decision` 文本里解析置信度、目标价和止损价。
+
+#### 4.6.5 `ReportViewer`：研报全文渲染
+
+报告查看器接收 `analysisStore.report` 对象，把各段报告（`market_report`、`news_report`、`fundamentals_report` 等）用 `react-markdown` 渲染成可阅读的格式。支持：
+- 按章节折叠和展开
+- 锚点跳转（从 `AgentCollaboration` 点击智能体卡片时触发）
+- Markdown 表格、代码块、列表渲染
+
+### 4.7 类型系统：从后端模型到前端界面的完整类型覆盖
+
+[`frontend/src/types/index.ts`](../frontend/src/types/index.ts) 定义了所有 TypeScript 类型，按用途分成七组：
+
+| 分组 | 主要类型 | 含义 |
+| --- | --- | --- |
+| 智能体 | `Agent`、`AgentStatus`、`AgentTeam` | 智能体元数据与状态枚举 |
+| 分析请求 | `AnalysisRequest`、`AnalysisResponse`、`JobStatus` | 分析任务提交与状态轮询 |
+| SSE 事件 | `AgentStatusEvent`、`AgentReportEvent`、`AgentMilestoneEvent` 等 | 实时事件载荷类型 |
+| 报告 | `AnalysisReport`、`StreamingSectionState` | 完整报告结构与流式输出缓冲 |
+| 结构化数据 | `RiskItem`、`KeyMetric` | LLM 提取的风险和指标 |
+| 用户与认证 | `AuthUser`、`AuthVerifyResponse` | 用户信息与登录响应 |
+| 配置 | `RuntimeConfig`、`RuntimeConfigUpdate` | 模型配置与更新载荷 |
+
+SSE 事件类型定义了一个很长的联合类型：
+
+```typescript
+export type SSEEventType =
+    | 'job.created' | 'job.running' | 'job.completed' | 'job.failed'
+    | 'agent.status' | 'agent.message' | 'agent.tool_call' | 'agent.report'
+    | 'agent.report.chunk' | 'agent.snapshot' | 'agent.milestone'
+    | 'agent.writing' | 'agent.activity' | 'agent.activity_complete'
+```
+
+这说明后端可以发送的事件类型比当前前端实际处理的更多，部分事件类型（如 `agent.report.chunk`、`agent.milestone`、`agent.activity`）在 `useSSE` 里还没有对应的处理分支。
+
+### 4.8 从用户输入到研报展示的完整交互链路
+
+把上面的组件串起来，一次完整的用户交互流程如下：
+
+```
+1. 用户打开 /analysis 页面
+   -> RequireAuth 检查登录态，未登录则重定向 /login
+
+2. 用户在 ChatCopilotPanel 输入自然语言查询
+   -> 前端调用 api.chatCompletion()，建立 SSE 连接到 /v1/chat/completions
+
+3. 后端 /v1/chat/completions 调用快模型解析意图
+   -> 提取 symbol、date、query、user_context
+   -> 调用 POST /v1/analyze 创建 job_id
+   -> SSE 推送 job.created 和 job.running 事件
+
+4. 前端 useSSE Hook 接收事件
+   -> setIsAnalyzing(true)
+   -> AgentCollaboration 展示 15 个智能体卡片，Market Analyst 进入 in_progress
+
+5. 后端开始执行 TradingAgentsGraph
+   -> 每个智能体完成时推送 agent.status 事件
+   -> 报告内容通过 agent.report 事件分段推送
+
+6. 前端持续更新
+   -> updateAgentStatus() 驱动智能体卡片状态变化
+   -> addAgentReport() 更新 streamingSections
+   -> 打字机效果让用户看到报告逐字生成
+
+7. 所有智能体完成后
+   -> job.completed 推送完整报告和结构化数据
+   -> setReport() 写入完整 AnalysisReport
+   -> setStructuredData() 写入 riskItems、keyMetrics、confidence 等
+   -> DecisionCard、RiskRadar、KeyMetrics 渲染结构化摘要
+
+8. 用户点击智能体卡片
+   -> ReportViewer 滚动到对应章节
+   -> 完整研报以 Markdown 格式展示
+```
+
+### 4.9 当前前端实现的约束与已知限制
+
+理解前端实现时，有几个约束值得明确：
+
+1. **SSE 事件处理不完整**：`useSSE` 当前只处理 9 种事件类型，但类型定义里有 14 种。`agent.report.chunk`、`agent.milestone`、`agent.activity` 等事件虽然后端可能发送，但前端没有对应的处理分支，会被静默忽略。
+
+2. **`agent.message` 和 `agent.tool_call` 已禁用**：这两个事件在 `analysisStore` 里是空操作，注释标注“消息已移至后端日志”。如果未来需要在界面恢复这些日志展示，需要重新实现 `addAgentMessage` 和 `addAgentToolCall`。
+
+3. **结构化数据提取有兜底正则**：后端 LLM 结构化提取失败时，前端会尝试用正则从 `final_trade_decision` 文本里解析置信度和价格。解析逻辑在 `Analysis.tsx` 里，匹配模式是 `置信度: XX%` 或 `目标价: ¥XX`。
+
+4. **报告持久化到 localStorage**：`analysisStore` 的 persist 配置会把 `report` 和 `chatMessages` 写入 `localStorage`。这意味着页面刷新后可以恢复上次分析的研报内容，但不适合存储大量历史报告（应该用 Reports 页面从后端查询）。
+
+5. **K 线图依赖市场数据 API**：`getKline()` 是公开接口不需要认证，但如果后端市场数据源配置不当，K 线面板会显示为空。
+
+### 4.10 这一章可以带走的结论
+
+理解第 4 章后，你应该能把前端的核心设计概括成四句话：
+
+1. 状态管理全集中在两个 Zustand store：`authStore` 管登录态，`analysisStore` 管分析全流程，后者通过 `useSSE` 把后端事件流实时映射到状态更新。
+2. 前端不维护自己的任务队列，而是通过 `EventSource` 订阅后端的 SSE 事件流，实现“后端推送、前端渲染”的实时交互。
+3. 研报展示走 Markdown 渲染，结构化决策走独立卡片，两者通过 `analysisStore.report` 共享同一份数据源。
+4. 组件设计遵循单一职责：聊天输入、状态可视化、K 线、决策卡片、报告查看各自独立，通过 store 共享状态。
+
+理解了前端如何消费后端 API 和 SSE 事件，再去看[第 5 章](#chapter-5)的模型配置、数据源和部署约束，就能完整回答“用户在前端看到的结果是怎么产生的、背后需要什么基础设施”这个问题。
 
 <a id="chapter-5"></a>
 ## 第5章：数据源、模型接入、配置与部署方式
